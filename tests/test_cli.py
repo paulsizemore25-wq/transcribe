@@ -19,8 +19,9 @@ class StubEngine:
 
     instances = []
 
-    def __init__(self, options=None):
+    def __init__(self, options=None, warn=None):
         self.options = options
+        self.warn = warn
         self.calls = []
         StubEngine.instances.append(self)
 

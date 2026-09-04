@@ -7,9 +7,12 @@ the program works fully offline.
 
 from __future__ import annotations
 
+import importlib.util
 import os
+import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Iterable
 
 from .audio import Audio
@@ -28,6 +31,42 @@ MODELS = (
 DEFAULT_MODEL = "large-v3-turbo"
 
 ProgressCallback = Callable[[Segment, float | None], None]
+
+CUDA_SETUP_HINT = (
+    "To use the GPU, install the CUDA 12 math libraries into this environment:\n"
+    "        pip install nvidia-cublas-cu12 \"nvidia-cudnn-cu12>=9,<10\"\n"
+    "        (or: pip install -e \".[cuda]\" from the project folder)\n"
+    "        Pass --device cpu to skip the GPU entirely."
+)
+
+_CUDA_FAILURE_HINTS = (
+    "cublas", "cudnn", "cuda", "cudart", "nvrtc", "libcu", "gpu",
+    "no kernel image", "out of memory",
+)
+
+
+def _is_cuda_failure(exc: Exception) -> bool:
+    return any(hint in str(exc).lower() for hint in _CUDA_FAILURE_HINTS)
+
+
+def _register_cuda_libraries() -> None:
+    """Make pip-installed CUDA libraries findable on Windows.
+
+    `pip install nvidia-cublas-cu12` drops the DLLs in
+    site-packages/nvidia/*/bin, which Windows does not search — so CTranslate2
+    reports `cublas64_12.dll is not found` even though the file is right there.
+    Registering those directories fixes it; on Linux the loader already handles
+    it via RPATH.
+    """
+    if sys.platform != "win32" or not hasattr(os, "add_dll_directory"):
+        return
+    spec = importlib.util.find_spec("nvidia")
+    for root in getattr(spec, "submodule_search_locations", None) or []:
+        for bin_dir in sorted(Path(root).glob("*/bin")):
+            try:
+                os.add_dll_directory(str(bin_dir))
+            except OSError:  # pragma: no cover - path vanished between glob and use
+                pass
 
 
 @dataclass
@@ -86,10 +125,18 @@ def resolve_compute_type(requested: str, device: str) -> str:
 class WhisperEngine:
     """Thin, testable wrapper around faster-whisper's WhisperModel."""
 
-    def __init__(self, options: EngineOptions | None = None) -> None:
+    def __init__(
+        self,
+        options: EngineOptions | None = None,
+        warn: Callable[[str], None] | None = None,
+    ) -> None:
         self.options = options or EngineOptions()
         self.device = resolve_device(self.options.device)
         self.compute_type = resolve_compute_type(self.options.compute_type, self.device)
+        # Only a device *we* picked may be silently swapped for another one; an
+        # explicit --device cuda must fail loudly instead.
+        self._device_was_auto = self.options.device == "auto"
+        self._warn = warn or (lambda message: None)
         self._model = None
         self._batched = None
 
@@ -100,24 +147,54 @@ class WhisperEngine:
         if self._model is not None:
             return self._model
         try:
+            self._model = self._create_model()
+        except Exception as exc:
+            if not self._can_fall_back(exc):
+                raise EngineError(self._explain_load_failure(exc)) from exc
+            self._fall_back_to_cpu(exc)
+            try:
+                self._model = self._create_model()
+            except Exception as retry_exc:
+                raise EngineError(self._explain_load_failure(retry_exc)) from retry_exc
+        return self._model
+
+    def _create_model(self):
+        try:
             from faster_whisper import WhisperModel
         except ImportError as exc:  # pragma: no cover - depends on the environment
             raise EngineError(
                 "faster-whisper is not installed. Run: pip install -r requirements.txt"
             ) from exc
 
-        try:
-            self._model = WhisperModel(
-                self.options.model,
-                device=self.device,
-                compute_type=self.compute_type,
-                cpu_threads=self.options.cpu_threads,
-                download_root=self.options.download_root,
-                local_files_only=self.options.local_files_only,
-            )
-        except Exception as exc:
-            raise EngineError(self._explain_load_failure(exc)) from exc
-        return self._model
+        if self.device == "cuda":
+            _register_cuda_libraries()
+
+        return WhisperModel(
+            self.options.model,
+            device=self.device,
+            compute_type=self.compute_type,
+            cpu_threads=self.options.cpu_threads,
+            download_root=self.options.download_root,
+            local_files_only=self.options.local_files_only,
+        )
+
+    # -- GPU fallback ------------------------------------------------------
+
+    def _can_fall_back(self, exc: Exception) -> bool:
+        """CUDA problems are recoverable when we, not the user, chose the GPU."""
+        if isinstance(exc, EngineError) or not self._device_was_auto or self.device != "cuda":
+            return False
+        return _is_cuda_failure(exc)
+
+    def _fall_back_to_cpu(self, exc: Exception) -> None:
+        self._warn(
+            f"GPU unavailable ({type(exc).__name__}: {exc}) — falling back to CPU.\n"
+            f"        {CUDA_SETUP_HINT}"
+        )
+        self.device = "cpu"
+        self.compute_type = resolve_compute_type(self.options.compute_type, "cpu")
+        self._model = None
+        self._batched = None
 
     def _explain_load_failure(self, exc: Exception) -> str:
         detail = f"{type(exc).__name__}: {exc}"
@@ -134,12 +211,8 @@ class WhisperEngine:
                 "proxy, set HTTPS_PROXY, or pre-download the model on another machine "
                 "and point --model at the local directory."
             )
-        if "cuda" in message or "cublas" in message or "cudnn" in message:
-            return (
-                f"CUDA initialisation failed ({detail}).\n"
-                "Re-run with --device cpu, or install the cuBLAS/cuDNN runtime that "
-                "CTranslate2 expects."
-            )
+        if _is_cuda_failure(exc):
+            return f"the GPU could not be used ({detail}).\n{CUDA_SETUP_HINT}"
         return f"could not load the '{self.options.model}' model ({detail})."
 
     # -- transcription -----------------------------------------------------
@@ -173,20 +246,29 @@ class WhisperEngine:
             kwargs["hallucination_silence_threshold"] = options.hallucination_silence_threshold
         kwargs.update(options.extra)
 
-        runner = model
         if options.batch_size and options.batch_size > 1:
-            runner = self._batched_pipeline(model)
             kwargs["batch_size"] = options.batch_size
             kwargs.pop("condition_on_previous_text", None)
             kwargs.pop("hallucination_silence_threshold", None)
 
         try:
-            raw_segments, info = runner.transcribe(audio.samples, **kwargs)
-            segments = list(self._collect(raw_segments, audio.duration, progress))
+            segments, info = self._run(audio, kwargs, options, progress)
         except EngineError:
             raise
         except Exception as exc:
-            raise EngineError(f"transcription failed for {source}: {type(exc).__name__}: {exc}") from exc
+            if not self._can_fall_back(exc):
+                raise EngineError(
+                    f"transcription failed for {source}: {type(exc).__name__}: {exc}"
+                ) from exc
+            # CTranslate2 only loads the CUDA libraries when it first decodes,
+            # so a broken GPU install surfaces here rather than at load time.
+            self._fall_back_to_cpu(exc)
+            try:
+                segments, info = self._run(audio, kwargs, options, progress)
+            except Exception as retry_exc:
+                raise EngineError(
+                    f"transcription failed for {source}: {type(retry_exc).__name__}: {retry_exc}"
+                ) from retry_exc
 
         return Transcript(
             source=source,
@@ -198,6 +280,16 @@ class WhisperEngine:
             task=options.task,
             elapsed=time.monotonic() - started,
         )
+
+    def _run(self, audio: Audio, kwargs: dict, options: DecodeOptions, progress):
+        model = self.load()
+        runner = model
+        if options.batch_size and options.batch_size > 1:
+            runner = self._batched_pipeline(model)
+        raw_segments, info = runner.transcribe(audio.samples, **kwargs)
+        # The generator is consumed here, inside the caller's error handling,
+        # because that is where CTranslate2 actually touches the GPU.
+        return list(self._collect(raw_segments, audio.duration, progress)), info
 
     def _batched_pipeline(self, model):
         if self._batched is None:
@@ -241,6 +333,23 @@ class WhisperEngine:
                     fraction = min(1.0, segment.end / duration)
                 progress(segment, fraction)
             yield segment
+
+
+def cuda_library_status() -> tuple[bool, str]:
+    """Actually try to load cuBLAS, the library CTranslate2 needs on a GPU.
+
+    Reporting "your GPU is detected" is useless if the math libraries are
+    missing — that is exactly the case that fails halfway through a long file.
+    """
+    import ctypes
+
+    _register_cuda_libraries()
+    name = "cublas64_12.dll" if sys.platform == "win32" else "libcublas.so.12"
+    try:
+        ctypes.CDLL(name)
+    except OSError as exc:
+        return False, f"{name} not loadable ({exc})"
+    return True, f"{name} loaded"
 
 
 def default_cpu_threads() -> int:

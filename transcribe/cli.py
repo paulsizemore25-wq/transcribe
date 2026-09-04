@@ -137,15 +137,20 @@ def main(argv: list[str] | None = None) -> int:
         print("transcribe: no audio or video files found in the given paths", file=sys.stderr)
         return 2
 
+    def warn(message: str) -> None:
+        # Always shown, even with --quiet: it changes how long the run takes.
+        print(f"transcribe: {message}", file=sys.stderr, flush=True)
+
     engine = WhisperEngine(
-        EngineOptions(
+        warn=warn,
+        options=EngineOptions(
             model=args.model,
             device=args.device,
             compute_type=args.compute_type,
             cpu_threads=args.threads,
             download_root=str(args.model_dir) if args.model_dir else None,
             local_files_only=args.offline,
-        )
+        ),
     )
     decode_options = DecodeOptions(
         language=args.language,
@@ -207,6 +212,16 @@ def _run_check(args: argparse.Namespace) -> int:
             lines.append(f"{package:<12} {getattr(module, '__version__', 'installed')}")
         except ImportError:
             lines.append(f"{package:<12} MISSING — run: pip install -r requirements.txt")
+
+    if device == "cuda":
+        from .engine import CUDA_SETUP_HINT, cuda_library_status
+
+        ok, detail = cuda_library_status()
+        lines.append(f"cuda libs    {'OK — ' if ok else 'MISSING — '}{detail}")
+        if not ok:
+            lines.append(f"             {CUDA_SETUP_HINT.splitlines()[0]}")
+            lines.append("             " + CUDA_SETUP_HINT.splitlines()[1].strip())
+            lines.append("             (transcription still works — it falls back to the CPU)")
 
     ffmpeg = shutil.which("ffmpeg")
     lines.append(f"ffmpeg cli   {ffmpeg or 'not found (not required — PyAV decodes audio)'}")

@@ -143,3 +143,80 @@ def test_load_failure_message_mentions_the_download(monkeypatch):
     with pytest.raises(EngineError) as excinfo:
         engine.load()
     assert "tiny" in str(excinfo.value)
+
+
+class CudaBrokenModel(FakeModel):
+    """Reproduces the Windows failure: CTranslate2 finds the GPU, but the CUDA
+    math libraries are missing, and it only says so once decoding starts."""
+
+    def transcribe(self, audio, **kwargs):
+        raise RuntimeError("Library cublas64_12.dll is not found or cannot be loaded")
+
+
+def test_auto_device_falls_back_to_cpu_when_cuda_is_broken(audio, monkeypatch):
+    warnings = []
+    engine = WhisperEngine(EngineOptions(device="auto"), warn=warnings.append)
+    engine.device = "cuda"  # pretend a GPU was detected
+    engine.compute_type = "float16"
+
+    models = [CudaBrokenModel(), FakeModel()]
+    monkeypatch.setattr(engine, "_create_model", lambda: models.pop(0))
+    engine._model = models.pop(0)  # the broken one is already "loaded"
+
+    transcript = engine.transcribe(audio, source="a.m4a")
+
+    assert transcript.text == "Hello there. Second line."
+    assert engine.device == "cpu"
+    assert engine.compute_type == "int8"
+    assert warnings and "falling back to CPU" in warnings[0]
+    assert "nvidia-cublas-cu12" in warnings[0]  # tells the user how to fix it
+
+
+def test_explicit_cuda_request_is_not_silently_downgraded(audio):
+    engine = WhisperEngine(EngineOptions(device="cuda"))
+    engine._model = CudaBrokenModel()
+
+    with pytest.raises(EngineError) as excinfo:
+        engine.transcribe(audio, source="a.m4a")
+    assert "cublas64_12.dll" in str(excinfo.value)
+    assert engine.device == "cuda"  # unchanged; the user asked for it explicitly
+
+
+def test_non_cuda_errors_do_not_trigger_a_retry(audio, monkeypatch):
+    engine = WhisperEngine(EngineOptions(device="auto"))
+    engine.device = "cuda"
+
+    class Broken(FakeModel):
+        def transcribe(self, audio, **kwargs):
+            raise ValueError("invalid audio")
+
+    engine._model = Broken()
+    monkeypatch.setattr(engine, "_create_model", lambda: pytest.fail("must not reload"))
+
+    with pytest.raises(EngineError, match="invalid audio"):
+        engine.transcribe(audio, source="a.m4a")
+
+
+def test_load_failure_falls_back_too(audio, monkeypatch):
+    engine = WhisperEngine(EngineOptions(device="auto"), warn=lambda message: None)
+    engine.device = "cuda"
+    attempts = []
+
+    def create():
+        attempts.append(engine.device)
+        if engine.device == "cuda":
+            raise RuntimeError("CUDA driver version is insufficient")
+        return FakeModel()
+
+    monkeypatch.setattr(engine, "_create_model", create)
+    assert engine.load() is not None
+    assert attempts == ["cuda", "cpu"]
+
+
+def test_cuda_failure_detection():
+    from transcribe.engine import _is_cuda_failure
+
+    assert _is_cuda_failure(RuntimeError("Library cublas64_12.dll is not found"))
+    assert _is_cuda_failure(RuntimeError("libcudnn_ops.so.9: cannot open shared object file"))
+    assert _is_cuda_failure(RuntimeError("CUDA failed with error out of memory"))
+    assert not _is_cuda_failure(RuntimeError("model file is corrupt"))

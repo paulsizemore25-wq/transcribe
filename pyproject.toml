@@ -17,6 +17,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.4"]
+# NVIDIA GPU support: CTranslate2 needs the CUDA 12 math libraries at runtime.
+cuda = ["nvidia-cublas-cu12", "nvidia-cudnn-cu12>=9,<10"]
 
 [project.scripts]
 transcribe = "transcribe.cli:main"

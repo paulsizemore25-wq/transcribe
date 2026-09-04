@@ -127,6 +127,17 @@ local CTranslate2 model directory, for fully air-gapped machines.
 ### Speed
 
 - On an NVIDIA GPU: `--device cuda --batch-size 16` is dramatically faster.
+  CTranslate2 needs the CUDA 12 math libraries at runtime — they do not come
+  with the driver. Install them into the same environment:
+
+  ```bash
+  pip install -e ".[cuda]"        # nvidia-cublas-cu12 + nvidia-cudnn-cu12
+  ```
+
+  Check it took with `transcribe --check`, which tries to load cuBLAS and says
+  so if it cannot. Without them you'll see `cublas64_12.dll is not found`
+  (Windows) or `libcublas.so.12: cannot open shared object file` (Linux); the
+  program warns and continues on the CPU rather than failing.
 - On CPU: `--beam-size 1` roughly halves the time at a small accuracy cost, and
   a smaller model helps more than any flag.
 - `--threads N` pins the CPU thread count; the default uses what CTranslate2
@@ -182,7 +193,7 @@ renames an option fails loudly instead of at 3 a.m. on a long recording.
 | Symptom | Fix |
 | --- | --- |
 | `could not fetch the ... model` | The first run needs internet access to Hugging Face. Behind a proxy, set `HTTPS_PROXY`; or copy a model directory over and pass it to `--model`. |
-| `CUDA initialisation failed` | Run with `--device cpu`, or install the cuBLAS/cuDNN runtime CTranslate2 expects. |
+| `cublas64_12.dll is not found` / `libcublas.so.12` | `pip install -e ".[cuda]"`, or just pass `--device cpu`. On auto-detected GPUs it falls back to the CPU by itself. |
 | Repeated/looping sentences | `--no-context`, and keep VAD enabled. |
 | Wrong language detected | Pass `--language`. |
 | Very slow on CPU | Smaller `--model`, `--beam-size 1`, or a GPU with `--batch-size`. |
