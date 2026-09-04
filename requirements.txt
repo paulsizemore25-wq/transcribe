@@ -1,0 +1,5 @@
+# Runtime dependencies. PyAV bundles the ffmpeg libraries, so decoding .m4a
+# needs nothing installed system-wide.
+faster-whisper>=1.1.0
+av>=11.0.0
+numpy>=1.24
