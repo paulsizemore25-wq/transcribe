@@ -100,7 +100,20 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _use_utf8_streams() -> None:
+    """Windows consoles default to cp1252, which cannot print most non-English
+    transcripts (or the arrows below) and raises UnicodeEncodeError when the
+    output is piped to a file.  UTF-8 everywhere keeps stdout matching the
+    files we write."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass  # not a reconfigurable text stream (e.g. captured in tests)
+
+
 def main(argv: list[str] | None = None) -> int:
+    _use_utf8_streams()
     parser = build_parser()
     args = parser.parse_args(argv)
 

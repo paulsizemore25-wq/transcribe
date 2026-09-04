@@ -26,6 +26,8 @@ transcribe interview.m4a
 
 Requires Python 3.9+.
 
+### macOS / Linux
+
 ```bash
 git clone https://github.com/paulsizemore25-wq/transcribe.git
 cd transcribe
@@ -36,7 +38,30 @@ That creates `.venv`, installs everything, and prints a diagnostic summary.
 Then either activate the environment (`source .venv/bin/activate`) and run
 `transcribe`, or call `./.venv/bin/transcribe` directly.
 
-Manual equivalent:
+### Windows
+
+Install Python 3.9+ from [python.org](https://www.python.org/downloads/windows/)
+with **"Add python.exe to PATH"** ticked, then in PowerShell:
+
+```powershell
+git clone https://github.com/paulsizemore25-wq/transcribe.git
+cd transcribe
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+Or download the repo as a ZIP, extract it, and double-click `install.bat`.
+
+Afterwards the command lives at `.\.venv\Scripts\transcribe.exe`:
+
+```powershell
+.\.venv\Scripts\transcribe.exe C:\Users\you\Recordings\interview.m4a
+```
+
+Activate the environment (`.\.venv\Scripts\Activate.ps1`) to shorten that to
+`transcribe`. Quote any path containing spaces. Output is written as UTF-8
+regardless of the console code page.
+
+### Manual (any platform)
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
@@ -162,6 +187,8 @@ renames an option fails loudly instead of at 3 a.m. on a long recording.
 | Wrong language detected | Pass `--language`. |
 | Very slow on CPU | Smaller `--model`, `--beam-size 1`, or a GPU with `--batch-size`. |
 | `decoded no audio` | The file is empty or corrupt; check it plays. |
+| Windows: `install.ps1 cannot be loaded` | Run it as `powershell -ExecutionPolicy Bypass -File .\install.ps1`, or use `install.bat`. |
+| Windows: `python` opens the Microsoft Store | Use `py -3` instead, or untick the App Execution Aliases for Python in Settings. |
 
 Not included: speaker diarization ("who said what"). Whisper does not do it;
 pipe the JSON output into pyannote.audio if you need speaker labels.
