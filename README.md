@@ -131,7 +131,7 @@ local CTranslate2 model directory, for fully air-gapped machines.
   with the driver. Install them into the same environment:
 
   ```bash
-  pip install -e ".[cuda]"        # nvidia-cublas-cu12 + nvidia-cudnn-cu12
+  python -m pip install -e ".[cuda]"   # cuBLAS (+ cuDNN on Linux; Windows already has it)
   ```
 
   Check it took with `transcribe --check`, which tries to load cuBLAS and says

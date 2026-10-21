@@ -32,10 +32,16 @@ DEFAULT_MODEL = "large-v3-turbo"
 
 ProgressCallback = Callable[[Segment, float | None], None]
 
+if sys.platform == "win32":
+    # CTranslate2's Windows wheel already bundles cuDNN; only cuBLAS is missing.
+    _CUDA_PIP_PACKAGES = "nvidia-cublas-cu12"
+else:
+    _CUDA_PIP_PACKAGES = 'nvidia-cublas-cu12 "nvidia-cudnn-cu12>=9,<10"'
+
 CUDA_SETUP_HINT = (
     "To use the GPU, install the CUDA 12 math libraries into this environment:\n"
-    "        pip install nvidia-cublas-cu12 \"nvidia-cudnn-cu12>=9,<10\"\n"
-    "        (or: pip install -e \".[cuda]\" from the project folder)\n"
+    f"        python -m pip install {_CUDA_PIP_PACKAGES}\n"
+    "        (or: python -m pip install -e \".[cuda]\" from the project folder)\n"
     "        Pass --device cpu to skip the GPU entirely."
 )
 
@@ -49,24 +55,60 @@ def _is_cuda_failure(exc: Exception) -> bool:
     return any(hint in str(exc).lower() for hint in _CUDA_FAILURE_HINTS)
 
 
-def _register_cuda_libraries() -> None:
-    """Make pip-installed CUDA libraries findable on Windows.
+# cuBLAS needs cuBLASLt, so that one is loaded first.
+_WINDOWS_CUDA_DLLS = ("cublasLt64_12.dll", "cublas64_12.dll")
+_registered_cuda_dirs: list = []  # keeps add_dll_directory handles alive
 
-    `pip install nvidia-cublas-cu12` drops the DLLs in
-    site-packages/nvidia/*/bin, which Windows does not search — so CTranslate2
-    reports `cublas64_12.dll is not found` even though the file is right there.
-    Registering those directories fixes it; on Linux the loader already handles
-    it via RPATH.
+
+def _nvidia_bin_dirs() -> list[Path]:
+    """The bin/ folders of pip-installed NVIDIA packages (nvidia-cublas-cu12...).
+
+    `nvidia` is a namespace package spread over every site-packages directory
+    that has one, hence `submodule_search_locations` rather than a single path.
     """
-    if sys.platform != "win32" or not hasattr(os, "add_dll_directory"):
-        return
     spec = importlib.util.find_spec("nvidia")
-    for root in getattr(spec, "submodule_search_locations", None) or []:
-        for bin_dir in sorted(Path(root).glob("*/bin")):
-            try:
-                os.add_dll_directory(str(bin_dir))
-            except OSError:  # pragma: no cover - path vanished between glob and use
-                pass
+    roots = getattr(spec, "submodule_search_locations", None) or []
+    return [bin_dir for root in roots for bin_dir in sorted(Path(root).glob("*/bin"))]
+
+
+def _register_cuda_libraries() -> None:
+    """Make pip-installed CUDA libraries visible to CTranslate2 on Windows.
+
+    pip puts the DLLs in site-packages/nvidia/*/bin, which Windows never
+    searches.  CTranslate2 loads cuBLAS lazily *by bare name* on the first GPU
+    computation, and a by-name load only looks at the standard search order
+    (PATH among it) — not at os.add_dll_directory folders.  So: preload each
+    DLL by full path, as ctranslate2/__init__.py does with its own DLLs (once
+    a module is loaded, Windows hands it back to any later by-name load), and
+    put the folders on PATH for anything that loads them indirectly.
+    """
+    if sys.platform != "win32" or _registered_cuda_dirs:
+        return
+    import ctypes
+
+    bin_dirs = _nvidia_bin_dirs()
+    if not bin_dirs:
+        return
+
+    path_entries = os.environ.get("PATH", "").split(os.pathsep)
+    missing = [str(bin_dir) for bin_dir in bin_dirs if str(bin_dir) not in path_entries]
+    if missing:
+        os.environ["PATH"] = os.pathsep.join(missing + path_entries)
+
+    for bin_dir in bin_dirs:
+        try:
+            _registered_cuda_dirs.append(os.add_dll_directory(str(bin_dir)))
+        except (AttributeError, OSError):
+            _registered_cuda_dirs.append(str(bin_dir))
+
+    for name in _WINDOWS_CUDA_DLLS:
+        candidate = next((d / name for d in bin_dirs if (d / name).is_file()), None)
+        if candidate is None:
+            continue
+        try:
+            ctypes.CDLL(str(candidate))
+        except OSError:
+            pass  # reported properly by cuda_library_status / the real load
 
 
 @dataclass
@@ -344,9 +386,15 @@ def cuda_library_status() -> tuple[bool, str]:
     import ctypes
 
     _register_cuda_libraries()
-    name = "cublas64_12.dll" if sys.platform == "win32" else "libcublas.so.12"
+    if sys.platform == "win32":
+        # winmode=0 is the classic LoadLibrary search — the one CTranslate2's
+        # by-name load uses.  Python's default would also search
+        # add_dll_directory folders and could report OK while CTranslate2 fails.
+        name, kwargs = "cublas64_12.dll", {"winmode": 0}
+    else:
+        name, kwargs = "libcublas.so.12", {}
     try:
-        ctypes.CDLL(name)
+        ctypes.CDLL(name, **kwargs)
     except OSError as exc:
         return False, f"{name} not loadable ({exc})"
     return True, f"{name} loaded"

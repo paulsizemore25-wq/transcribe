@@ -1,3 +1,6 @@
+import os
+import sys
+
 import numpy as np
 import pytest
 
@@ -220,3 +223,51 @@ def test_cuda_failure_detection():
     assert _is_cuda_failure(RuntimeError("libcudnn_ops.so.9: cannot open shared object file"))
     assert _is_cuda_failure(RuntimeError("CUDA failed with error out of memory"))
     assert not _is_cuda_failure(RuntimeError("model file is corrupt"))
+
+
+def test_windows_cuda_dlls_are_preloaded_and_put_on_path(tmp_path, monkeypatch):
+    """Mirrors the Windows layout of `pip install nvidia-cublas-cu12`, with
+    `nvidia` as a namespace package (the real wheel ships no __init__.py)."""
+    import ctypes
+    import importlib
+
+    import transcribe.engine as engine_module
+
+    bin_dir = tmp_path / "site" / "nvidia" / "cublas" / "bin"
+    bin_dir.mkdir(parents=True)
+    for name in ("cublas64_12.dll", "cublasLt64_12.dll"):
+        (bin_dir / name).write_bytes(b"")
+    monkeypatch.syspath_prepend(str(tmp_path / "site"))
+    importlib.invalidate_caches()
+
+    loaded, added = [], []
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(ctypes, "CDLL", lambda path, **kwargs: loaded.append(path))
+    monkeypatch.setattr(os, "add_dll_directory", lambda path: added.append(path), raising=False)
+    monkeypatch.setenv("PATH", "C:\\Windows")
+    monkeypatch.setattr(engine_module, "_registered_cuda_dirs", [])
+
+    engine_module._register_cuda_libraries()
+
+    assert os.environ["PATH"].split(os.pathsep)[0] == str(bin_dir)
+    assert added == [str(bin_dir)]
+    # cuBLASLt first: cuBLAS depends on it.
+    assert loaded == [str(bin_dir / "cublasLt64_12.dll"), str(bin_dir / "cublas64_12.dll")]
+
+    engine_module._register_cuda_libraries()  # idempotent
+    assert len(loaded) == 2
+
+
+def test_windows_probe_uses_the_classic_search_order(monkeypatch):
+    import ctypes
+
+    import transcribe.engine as engine_module
+
+    calls = []
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(engine_module, "_register_cuda_libraries", lambda: None)
+    monkeypatch.setattr(ctypes, "CDLL", lambda name, **kwargs: calls.append((name, kwargs)))
+
+    ok, _ = engine_module.cuda_library_status()
+    assert ok
+    assert calls == [("cublas64_12.dll", {"winmode": 0})]
