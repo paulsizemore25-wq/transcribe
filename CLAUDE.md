@@ -42,7 +42,8 @@ passing after any dependency upgrade.
 - Project checked out at `D:\transcribe-main` (earlier notes said
   `D:\transcribe`), venv activated, editable install
   (`git pull` updates the tool, no reinstall needed).
-- Uses `--model large-v3 --device cuda --batch-size 16`.
+- Uses `--model large-v3 --device cuda`. Batch 16 runs out of GPU memory;
+  batch 8 fits (float16). A 2h37m file took 147 s (64x realtime).
 
 ## Hard-won facts (don't re-learn these)
 
@@ -93,8 +94,8 @@ no network requests at all. Never add telemetry, uploads, or cloud APIs.
 ## Status
 
 - The Windows cuBLAS fix (commit 7e0c210) is confirmed: `--check` on the
-  user's machine reports `cublas64_12.dll loaded`. A full GPU transcription
-  has not completed yet (GPU memory, see above).
+  user's machine reports `cublas64_12.dll loaded`, and a full GPU run
+  succeeded, including the OOM → reload → batch 8 recovery.
 - The user tests new code with `python -m transcribe` from the checkout
   folder; they update by downloading branch ZIPs, not git. If GPU problems come up, ask for `transcribe --check --device cuda`
   output first.
