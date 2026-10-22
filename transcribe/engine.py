@@ -55,6 +55,17 @@ def _is_cuda_failure(exc: Exception) -> bool:
     return any(hint in str(exc).lower() for hint in _CUDA_FAILURE_HINTS)
 
 
+def _is_out_of_memory(exc: Exception) -> bool:
+    return "out of memory" in str(exc).lower()
+
+
+OUT_OF_MEMORY_HINT = (
+    "        The model does not fit in GPU memory. Try --compute-type int8_float16\n"
+    "        (about half the memory, near-identical accuracy), close other programs\n"
+    "        using the GPU, or use --model large-v3-turbo."
+)
+
+
 # cuBLAS needs cuBLASLt, so that one is loaded first.
 _WINDOWS_CUDA_DLLS = ("cublasLt64_12.dll", "cublas64_12.dll")
 _registered_cuda_dirs: list = []  # keeps add_dll_directory handles alive
@@ -210,6 +221,7 @@ class WhisperEngine:
         self._model = None
         self._batched = None
         self._warned_unbatched = False
+        self._batch_limit: int | None = None
 
     # -- model loading -----------------------------------------------------
 
@@ -327,20 +339,19 @@ class WhisperEngine:
                 self._warned_unbatched = True
             batched = False
         if batched:
-            kwargs["batch_size"] = options.batch_size
+            # A size that already ran out of memory on an earlier file is not retried.
+            kwargs["batch_size"] = min(options.batch_size, self._batch_limit or options.batch_size)
             kwargs["without_timestamps"] = not options.segment_timestamps
             kwargs.pop("condition_on_previous_text", None)
             kwargs.pop("hallucination_silence_threshold", None)
 
         try:
-            segments, info = self._run(audio, kwargs, batched, progress)
+            segments, info = self._run_within_memory(audio, kwargs, batched, progress)
         except EngineError:
             raise
         except Exception as exc:
             if not self._can_fall_back(exc):
-                raise EngineError(
-                    f"transcription failed for {source}: {type(exc).__name__}: {exc}"
-                ) from exc
+                raise self._transcription_failed(source, exc) from exc
             # CTranslate2 only loads the CUDA libraries when it first decodes,
             # so a broken GPU install surfaces here rather than at load time.
             self._fall_back_to_cpu(exc)
@@ -349,9 +360,7 @@ class WhisperEngine:
             except EngineError:
                 raise
             except Exception as retry_exc:
-                raise EngineError(
-                    f"transcription failed for {source}: {type(retry_exc).__name__}: {retry_exc}"
-                ) from retry_exc
+                raise self._transcription_failed(source, retry_exc) from retry_exc
 
         return Transcript(
             source=source,
@@ -363,6 +372,31 @@ class WhisperEngine:
             task=options.task,
             elapsed=time.monotonic() - started,
         )
+
+    def _run_within_memory(self, audio: Audio, kwargs: dict, batched: bool, progress):
+        """_run, halving the batch size each time the GPU runs out of memory.
+
+        How big a batch fits depends on the card, the model and whatever else
+        is using video memory, so a fixed --batch-size cannot be right everywhere.
+        """
+        while True:
+            try:
+                return self._run(audio, kwargs, batched, progress)
+            except EngineError:
+                raise
+            except Exception as exc:
+                size = kwargs.get("batch_size", 1)
+                if not (batched and size > 1 and _is_out_of_memory(exc)):
+                    raise
+                smaller = size // 2
+                self._warn(f"the GPU ran out of memory at batch size {size}; retrying with {smaller}.")
+                kwargs["batch_size"] = self._batch_limit = smaller
+
+    def _transcription_failed(self, source: str, exc: Exception) -> EngineError:
+        message = f"transcription failed for {source}: {type(exc).__name__}: {exc}"
+        if _is_out_of_memory(exc):
+            message += f"\n{OUT_OF_MEMORY_HINT}"
+        return EngineError(message)
 
     def _run(self, audio: Audio, kwargs: dict, batched: bool, progress):
         model = self.load()

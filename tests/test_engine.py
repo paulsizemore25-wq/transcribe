@@ -368,3 +368,45 @@ def test_load_failure_is_a_model_load_error():
     engine = WhisperEngine(EngineOptions(model="tiny", local_files_only=True))
     with pytest.raises(ModelLoadError):
         engine.load()
+
+
+class OutOfMemoryAbove(FakeModel):
+    """Runs out of GPU memory whenever the batch is bigger than `fits`."""
+
+    def __init__(self, fits):
+        super().__init__()
+        self.fits = fits
+
+    def transcribe(self, audio, **kwargs):
+        self.calls.append((audio, kwargs))
+        if kwargs["batch_size"] > self.fits:
+            raise RuntimeError("CUDA failed with error out of memory")
+        return iter(self.segments), FakeInfo()
+
+
+def test_out_of_memory_halves_the_batch_until_it_fits(audio):
+    warnings = []
+    model = OutOfMemoryAbove(fits=4)
+    engine = WhisperEngine(EngineOptions(device="cuda"), warn=warnings.append)
+    engine._model = engine._batched = model
+
+    transcript = engine.transcribe(audio, source="a.m4a", options=DecodeOptions(batch_size=16))
+
+    assert transcript.text == "Hello there. Second line."
+    assert [kwargs["batch_size"] for _, kwargs in model.calls] == [16, 8, 4]
+    assert len(warnings) == 2 and "out of memory" in warnings[0]
+    assert engine.device == "cuda"  # stayed on the GPU
+
+    # the next file starts at the size that worked
+    engine.transcribe(audio, source="b.m4a", options=DecodeOptions(batch_size=16))
+    assert model.calls[-1][1]["batch_size"] == 4 and len(model.calls) == 4
+
+
+def test_out_of_memory_at_batch_size_one_explains_what_to_try(audio):
+    model = OutOfMemoryAbove(fits=0)
+    engine = WhisperEngine(EngineOptions(device="cuda"), warn=lambda message: None)
+    engine._model = engine._batched = model
+
+    with pytest.raises(EngineError, match="int8_float16"):
+        engine.transcribe(audio, source="a.m4a", options=DecodeOptions(batch_size=2))
+    assert [kwargs["batch_size"] for _, kwargs in model.calls] == [2, 1]

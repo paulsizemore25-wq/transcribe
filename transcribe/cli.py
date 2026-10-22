@@ -153,6 +153,7 @@ def main(argv: list[str] | None = None) -> int:
 
     def warn(message: str) -> None:
         # Always shown, even with --quiet: it changes how long the run takes.
+        _clear_progress(args)
         print(f"transcribe: {message}", file=sys.stderr, flush=True)
 
     engine = WhisperEngine(

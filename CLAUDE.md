@@ -39,7 +39,8 @@ passing after any dependency upgrade.
 ## The user's machine
 
 - Windows, PowerShell, Python 3.13, NVIDIA GPU, 20 CPU threads.
-- Project checked out at `D:\transcribe`, venv activated, editable install
+- Project checked out at `D:\transcribe-main` (earlier notes said
+  `D:\transcribe`), venv activated, editable install
   (`git pull` updates the tool, no reinstall needed).
 - Uses `--model large-v3 --device cuda --batch-size 16`.
 
@@ -74,6 +75,9 @@ passing after any dependency upgrade.
   only the first temperature, and defaults to `without_timestamps=True`
   (one segment per ~30 s chunk); the CLI asks for timestamps unless the only
   output format is txt.
+- `large-v3` float16 at `--batch-size 16` ran out of GPU memory on the
+  user's card ("CUDA failed with error out of memory"). The engine now halves
+  the batch size on OOM and remembers the size that fit.
 - Decoding is ~5 s per 30 min of audio here; the CLI decodes the next file
   on a daemon thread while the current one transcribes.
 
@@ -85,7 +89,7 @@ no network requests at all. Never add telemetry, uploads, or cloud APIs.
 
 ## Status
 
-- The Windows cuBLAS fix (commit 7e0c210) is not yet confirmed on the user's
-  machine. If GPU problems come up, ask for `transcribe --check --device cuda`
+- The Windows cuBLAS fix (commit 7e0c210): the user's GPU got as far as an
+  out-of-memory error, so CUDA initialises; a full GPU run is not yet confirmed. If GPU problems come up, ask for `transcribe --check --device cuda`
   output first.
 - Not implemented: speaker diarization (would need pyannote.audio).
