@@ -384,29 +384,60 @@ class OutOfMemoryAbove(FakeModel):
         return iter(self.segments), FakeInfo()
 
 
+def _gpu_engine(model, warnings=None):
+    """An explicit --device cuda engine whose 'reloads' hand back `model`."""
+    engine = WhisperEngine(
+        EngineOptions(device="cuda"), warn=(warnings.append if warnings is not None else lambda m: None)
+    )
+    engine.loads = 0
+
+    def create():
+        engine.loads += 1
+        return model
+
+    engine._create_model = create
+    engine._batched_pipeline = lambda loaded: loaded
+    return engine
+
+
 def test_out_of_memory_halves_the_batch_until_it_fits(audio):
     warnings = []
     model = OutOfMemoryAbove(fits=4)
-    engine = WhisperEngine(EngineOptions(device="cuda"), warn=warnings.append)
-    engine._model = engine._batched = model
+    engine = _gpu_engine(model, warnings)
 
     transcript = engine.transcribe(audio, source="a.m4a", options=DecodeOptions(batch_size=16))
 
     assert transcript.text == "Hello there. Second line."
     assert [kwargs["batch_size"] for _, kwargs in model.calls] == [16, 8, 4]
     assert len(warnings) == 2 and "out of memory" in warnings[0]
+    assert engine.loads == 3  # a fresh model after each out-of-memory error
     assert engine.device == "cuda"  # stayed on the GPU
 
-    # the next file starts at the size that worked
+    # the next file starts at the size that worked, on the model already loaded
     engine.transcribe(audio, source="b.m4a", options=DecodeOptions(batch_size=16))
     assert model.calls[-1][1]["batch_size"] == 4 and len(model.calls) == 4
+    assert engine.loads == 3
 
 
 def test_out_of_memory_at_batch_size_one_explains_what_to_try(audio):
     model = OutOfMemoryAbove(fits=0)
-    engine = WhisperEngine(EngineOptions(device="cuda"), warn=lambda message: None)
-    engine._model = engine._batched = model
+    engine = _gpu_engine(model)
 
     with pytest.raises(EngineError, match="int8_float16"):
         engine.transcribe(audio, source="a.m4a", options=DecodeOptions(batch_size=2))
     assert [kwargs["batch_size"] for _, kwargs in model.calls] == [2, 1]
+
+
+def test_gpu_left_broken_after_out_of_memory_names_the_batch_size_to_use(audio):
+    """What the user's card did: the retry after an OOM failed differently."""
+
+    class BrokenAfterOOM(FakeModel):
+        def transcribe(self, audio, **kwargs):
+            self.calls.append((audio, kwargs))
+            if len(self.calls) == 1:
+                raise RuntimeError("CUDA failed with error out of memory")
+            raise RuntimeError("parallel_for failed: cudaErrorInvalidDevice: invalid device ordinal")
+
+    engine = _gpu_engine(BrokenAfterOOM())
+    with pytest.raises(EngineError, match="Start again with --batch-size 8"):
+        engine.transcribe(audio, source="a.m4a", options=DecodeOptions(batch_size=16))

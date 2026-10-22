@@ -76,8 +76,11 @@ passing after any dependency upgrade.
   (one segment per ~30 s chunk); the CLI asks for timestamps unless the only
   output format is txt.
 - `large-v3` float16 at `--batch-size 16` ran out of GPU memory on the
-  user's card ("CUDA failed with error out of memory"). The engine now halves
-  the batch size on OOM and remembers the size that fit.
+  user's card ("CUDA failed with error out of memory"). Retrying at batch 8
+  on the same model then failed with "parallel_for failed:
+  cudaErrorInvalidDevice", so on OOM the engine drops and reloads the model
+  before halving the batch, remembers the size, and if the GPU still fails
+  tells the user which --batch-size to start a fresh run with.
 - Decoding is ~5 s per 30 min of audio here; the CLI decodes the next file
   on a daemon thread while the current one transcribes.
 
@@ -89,7 +92,10 @@ no network requests at all. Never add telemetry, uploads, or cloud APIs.
 
 ## Status
 
-- The Windows cuBLAS fix (commit 7e0c210): the user's GPU got as far as an
-  out-of-memory error, so CUDA initialises; a full GPU run is not yet confirmed. If GPU problems come up, ask for `transcribe --check --device cuda`
+- The Windows cuBLAS fix (commit 7e0c210) is confirmed: `--check` on the
+  user's machine reports `cublas64_12.dll loaded`. A full GPU transcription
+  has not completed yet (GPU memory, see above).
+- The user tests new code with `python -m transcribe` from the checkout
+  folder; they update by downloading branch ZIPs, not git. If GPU problems come up, ask for `transcribe --check --device cuda`
   output first.
 - Not implemented: speaker diarization (would need pyannote.audio).

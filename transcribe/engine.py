@@ -7,6 +7,7 @@ the program works fully offline.
 
 from __future__ import annotations
 
+import gc
 import importlib.util
 import os
 import sys
@@ -388,13 +389,28 @@ class WhisperEngine:
                 size = kwargs.get("batch_size", 1)
                 if not (batched and size > 1 and _is_out_of_memory(exc)):
                     raise
-                smaller = size // 2
-                self._warn(f"the GPU ran out of memory at batch size {size}; retrying with {smaller}.")
-                kwargs["batch_size"] = self._batch_limit = smaller
+            # Outside the except block, so the traceback no longer pins the model.
+            smaller = size // 2
+            self._warn(f"the GPU ran out of memory at batch size {size}; reloading the model to retry with {smaller}.")
+            kwargs["batch_size"] = self._batch_limit = smaller
+            # Reusing the model after a CUDA out-of-memory error failed on the
+            # user's card ("parallel_for failed: cudaErrorInvalidDevice"), so
+            # start from a fresh one; _run loads it again.
+            self._model = None
+            self._batched = None
+            gc.collect()
 
     def _transcription_failed(self, source: str, exc: Exception) -> EngineError:
         message = f"transcription failed for {source}: {type(exc).__name__}: {exc}"
-        if _is_out_of_memory(exc):
+        if self._batch_limit is not None and self.device == "cuda":
+            # The GPU ran out of memory earlier and did not recover in this run;
+            # a fresh run at the smaller size never hits that state at all.
+            message += (
+                f"\n        The GPU ran out of memory earlier in this run. Start again with"
+                f" --batch-size {self._batch_limit} (or lower), and consider"
+                " --compute-type int8_float16."
+            )
+        elif _is_out_of_memory(exc):
             message += f"\n{OUT_OF_MEMORY_HINT}"
         return EngineError(message)
 
