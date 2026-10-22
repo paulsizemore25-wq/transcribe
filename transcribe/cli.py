@@ -4,21 +4,24 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
 import time
 from pathlib import Path
 
 from . import __version__
-from .audio import AUDIO_EXTENSIONS, load_audio
+from .audio import AUDIO_EXTENSIONS, Audio, load_audio
 from .engine import (
     DEFAULT_MODEL,
     MODELS,
     DecodeOptions,
     EngineOptions,
     WhisperEngine,
+    cached_model_path,
+    default_cpu_threads,
     resolve_compute_type,
     resolve_device,
 )
-from .errors import TranscribeError
+from .errors import ModelLoadError, TranscribeError
 from .formats import FORMATS, render
 from .transcript import Segment, Transcript
 
@@ -137,8 +140,20 @@ def main(argv: list[str] | None = None) -> int:
         print("transcribe: no audio or video files found in the given paths", file=sys.stderr)
         return 2
 
+    pending: list[tuple[Path, dict[str, Path]]] = []
+    for path in files:
+        targets = {fmt: _output_path(path, fmt, args.output_dir) for fmt in formats}
+        if args.skip_existing and all(target.exists() for target in targets.values()):
+            _log(f"skip {path.name} (output already exists)", args)
+        else:
+            pending.append((path, targets))
+    if not pending:
+        _log("nothing to do (everything already had output; drop --skip-existing to redo it)", args)
+        return 0
+
     def warn(message: str) -> None:
         # Always shown, even with --quiet: it changes how long the run takes.
+        _clear_progress(args)
         print(f"transcribe: {message}", file=sys.stderr, flush=True)
 
     engine = WhisperEngine(
@@ -162,32 +177,65 @@ def main(argv: list[str] | None = None) -> int:
         hotwords=args.hotwords,
         condition_on_previous_text=not args.no_context,
         batch_size=args.batch_size,
+        segment_timestamps=formats != ["txt"],
     )
 
-    if not args.quiet:
-        device = resolve_device(args.device)
-        compute = resolve_compute_type(args.compute_type, device)
-        _log(f"model {args.model} on {device} ({compute}) — {len(files)} file(s)", args)
+    _log(f"model {args.model} on {engine.device} ({engine.compute_type}) — {len(pending)} file(s)", args)
 
     failures = 0
-    written_any = False
-    for path in files:
-        try:
-            wrote = _process_file(path, engine, decode_options, formats, args)
-            written_any = written_any or wrote
-        except TranscribeError as exc:
-            failures += 1
-            print(f"transcribe: {path}: {exc}", file=sys.stderr)
-        except KeyboardInterrupt:
-            print("\ntranscribe: interrupted", file=sys.stderr)
-            return 130
+    try:
+        decoding = _Decode(pending[0][0])  # runs while the model loads
+        engine.load()
+        for index, (path, targets) in enumerate(pending):
+            current = decoding
+            if index + 1 < len(pending):
+                # Decode the next file while this one is being transcribed.
+                decoding = _Decode(pending[index + 1][0])
+            try:
+                _process_file(path, targets, current, engine, decode_options, formats, args)
+            except ModelLoadError:
+                raise
+            except TranscribeError as exc:
+                failures += 1
+                print(f"transcribe: {path}: {exc}", file=sys.stderr)
+    except ModelLoadError as exc:
+        # Every remaining file would fail the same way, slowly.
+        print(f"transcribe: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\ntranscribe: interrupted", file=sys.stderr)
+        return 130
 
     if failures:
-        print(f"transcribe: {failures} of {len(files)} file(s) failed", file=sys.stderr)
+        print(f"transcribe: {failures} of {len(pending)} file(s) failed", file=sys.stderr)
         return 1
-    if not written_any and not args.stdout:
-        _log("nothing to do (everything already had output; drop --skip-existing to redo it)", args)
     return 0
+
+
+class _Decode:
+    """Decodes one file on a background thread.
+
+    A daemon thread, so Ctrl-C never waits for a decode nobody needs any more.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._audio: Audio | None = None
+        self._error: BaseException | None = None
+        self._thread = threading.Thread(target=self._run, args=(path,), daemon=True)
+        self._thread.start()
+
+    def _run(self, path: Path) -> None:
+        try:
+            self._audio = load_audio(path)
+        except BaseException as exc:
+            self._error = exc
+
+    def result(self) -> Audio:
+        while self._thread.is_alive():
+            self._thread.join(0.1)  # short waits keep Ctrl-C responsive on Windows
+        if self._error is not None:
+            raise self._error
+        return self._audio
 
 
 def _run_check(args: argparse.Namespace) -> int:
@@ -201,9 +249,8 @@ def _run_check(args: argparse.Namespace) -> int:
     lines = [
         f"transcribe {__version__}",
         f"python       {platform.python_version()} ({platform.system()} {platform.machine()})",
-        f"cpu threads  {args.threads or os.cpu_count() or '?'}",
+        f"cpu threads  {args.threads or default_cpu_threads()} (of {os.cpu_count() or '?'} logical CPUs)",
         f"device       {device} ({resolve_compute_type(args.compute_type, device)})",
-        f"default model {DEFAULT_MODEL}",
     ]
 
     for package in ("faster_whisper", "ctranslate2", "av", "numpy"):
@@ -226,8 +273,11 @@ def _run_check(args: argparse.Namespace) -> int:
     ffmpeg = shutil.which("ffmpeg")
     lines.append(f"ffmpeg cli   {ffmpeg or 'not found (not required — PyAV decodes audio)'}")
 
-    cache = args.model_dir or Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
-    lines.append(f"model cache  {cache}{'' if Path(cache).exists() else ' (empty — first run will download)'}")
+    model_path = cached_model_path(args.model, str(args.model_dir) if args.model_dir else None)
+    if model_path:
+        lines.append(f"model        {args.model} — ready at {model_path}")
+    else:
+        lines.append(f"model        {args.model} — not downloaded yet (the first run fetches it)")
 
     print("\n".join(lines))
     return 0
@@ -235,19 +285,16 @@ def _run_check(args: argparse.Namespace) -> int:
 
 def _process_file(
     path: Path,
+    targets: dict[str, Path],
+    decoding: _Decode,
     engine: WhisperEngine,
     decode_options: DecodeOptions,
     formats: list[str],
     args: argparse.Namespace,
-) -> bool:
-    targets = {fmt: _output_path(path, fmt, args.output_dir) for fmt in formats}
-    if args.skip_existing and all(target.exists() for target in targets.values()):
-        _log(f"skip {path.name} (output already exists)", args)
-        return False
-
+) -> None:
     _log(f"→ {path.name}", args)
     started = time.monotonic()
-    audio = load_audio(path)
+    audio = decoding.result()
     progress = _make_progress(path, audio.duration, args)
     transcript = engine.transcribe(audio, source=str(path), options=decode_options, progress=progress)
     _clear_progress(args)
@@ -263,7 +310,6 @@ def _process_file(
 
     elapsed = time.monotonic() - started
     _log(f"  {_summary(transcript, audio.duration, elapsed)}", args)
-    return True
 
 
 def _summary(transcript: Transcript, duration: float, elapsed: float) -> str:

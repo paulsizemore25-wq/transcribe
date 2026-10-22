@@ -39,9 +39,11 @@ passing after any dependency upgrade.
 ## The user's machine
 
 - Windows, PowerShell, Python 3.13, NVIDIA GPU, 20 CPU threads.
-- Project checked out at `D:\transcribe`, venv activated, editable install
+- Project checked out at `D:\transcribe-main` (earlier notes said
+  `D:\transcribe`), venv activated, editable install
   (`git pull` updates the tool, no reinstall needed).
-- Uses `--model large-v3 --device cuda --batch-size 16`.
+- Uses `--model large-v3 --device cuda`. Batch 16 runs out of GPU memory;
+  batch 8 fits (float16). A 2h37m file took 147 s (64x realtime).
 
 ## Hard-won facts (don't re-learn these)
 
@@ -64,17 +66,37 @@ passing after any dependency upgrade.
   `hallucination_silence_threshold`; the engine strips them.
 - PyAV's wheel has no libvorbis encoder: test .ogg files are made with the
   native `vorbis` encoder (`strict=experimental`). Decoding is unaffected.
+- faster-whisper given a model *name* asks the Hub for the latest commit on
+  every run, and a `ProxyError` there is fatal even with the model cached.
+  `engine.cached_model_path` resolves the cache first; only a miss downloads.
+- CTranslate2's default is 4 CPU threads regardless of the machine;
+  `default_cpu_threads()` picks ~one per physical core instead.
+- The batched pipeline (faster-whisper 1.2) raises "No clip timestamps found"
+  without VAD on audio over 30 s, so `--no-vad` disables batching. It uses
+  only the first temperature, and defaults to `without_timestamps=True`
+  (one segment per ~30 s chunk); the CLI asks for timestamps unless the only
+  output format is txt.
+- `large-v3` float16 at `--batch-size 16` ran out of GPU memory on the
+  user's card ("CUDA failed with error out of memory"). Retrying at batch 8
+  on the same model then failed with "parallel_for failed:
+  cudaErrorInvalidDevice", so on OOM the engine drops and reloads the model
+  before halving the batch, remembers the size, and if the GPU still fails
+  tells the user which --batch-size to start a fresh run with.
+- Decoding is ~5 s per 30 min of audio here; the CLI decodes the next file
+  on a daemon thread while the current one transcribes.
 
 ## Privacy
 
 Our package imports no networking code. The only network access is
-huggingface_hub: the one-time model download, plus a commit-hash metadata
-check on each run unless `--offline` (or `HF_HUB_OFFLINE=1`) is set. Never
-add telemetry, uploads, or cloud APIs.
+huggingface_hub's one-time model download; once a model is cached, runs make
+no network requests at all. Never add telemetry, uploads, or cloud APIs.
 
 ## Status
 
-- The Windows cuBLAS fix (commit 7e0c210) is not yet confirmed on the user's
-  machine. If GPU problems come up, ask for `transcribe --check --device cuda`
+- The Windows cuBLAS fix (commit 7e0c210) is confirmed: `--check` on the
+  user's machine reports `cublas64_12.dll loaded`, and a full GPU run
+  succeeded, including the OOM → reload → batch 8 recovery.
+- The user tests new code with `python -m transcribe` from the checkout
+  folder; they update by downloading branch ZIPs, not git. If GPU problems come up, ask for `transcribe --check --device cuda`
   output first.
 - Not implemented: speaker diarization (would need pyannote.audio).

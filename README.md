@@ -14,8 +14,9 @@ transcribe interview.m4a
 ## Why this setup
 
 - **Accurate.** Whisper `large-v3-turbo` by default, with beam search,
-  temperature fallback, voice-activity filtering and a hallucination guard —
-  the settings that matter for real recordings, on by default.
+  temperature fallback and voice-activity filtering — the settings that matter
+  for real recordings, on by default. `--word-timestamps` adds a guard against
+  text invented over long silences.
 - **Local and private.** No API keys, no uploads, no per-minute billing. Works
   on a plane once the model is cached.
 - **No system dependencies.** PyAV ships the ffmpeg libraries inside its wheel,
@@ -138,10 +139,18 @@ local CTranslate2 model directory, for fully air-gapped machines.
   so if it cannot. Without them you'll see `cublas64_12.dll is not found`
   (Windows) or `libcublas.so.12: cannot open shared object file` (Linux); the
   program warns and continues on the CPU rather than failing.
+
+  The speed has a price: batched decoding skips temperature fallback,
+  conditioning on the previous text and the silence-hallucination guard. For a
+  recording that comes out garbled or repetitive, re-run that one file without
+  `--batch-size`. `--no-vad` turns batching off, since the batched pipeline
+  needs VAD to split the audio.
 - On CPU: `--beam-size 1` roughly halves the time at a small accuracy cost, and
   a smaller model helps more than any flag.
-- `--threads N` pins the CPU thread count; the default uses what CTranslate2
-  thinks is best.
+- `--threads N` pins the CPU thread count. The default is about one thread per
+  physical core (CTranslate2 on its own would use 4, however big the machine).
+- In a batch, the next file is decoded while the current one is transcribed,
+  and the model loads while the first file decodes.
 - Apple Silicon runs on the CPU backend with int8 quantisation (CTranslate2 has
   no Metal backend); `large-v3-turbo` still runs comfortably faster than
   realtime on an M-series chip.

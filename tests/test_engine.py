@@ -271,3 +271,173 @@ def test_windows_probe_uses_the_classic_search_order(monkeypatch):
     ok, _ = engine_module.cuda_library_status()
     assert ok
     assert calls == [("cublas64_12.dll", {"winmode": 0})]
+
+
+def test_batched_without_vad_runs_unbatched_and_warns_once(audio):
+    warnings = []
+    model = FakeModel()
+    engine = WhisperEngine(EngineOptions(), warn=warnings.append)
+    engine._model = model
+    engine._batched_pipeline = lambda model: pytest.fail("batched pipeline needs VAD")
+
+    options = DecodeOptions(batch_size=16, vad_filter=False)
+    engine.transcribe(audio, source="a.m4a", options=options)
+    engine.transcribe(audio, source="b.m4a", options=options)
+
+    assert "batch_size" not in model.calls[0][1]
+    assert len(warnings) == 1 and "--no-vad" in warnings[0]
+
+
+@pytest.mark.parametrize("segment_timestamps", [True, False])
+def test_batched_segment_timestamps(audio, segment_timestamps):
+    model = FakeModel()
+    engine = engine_with(model)
+    engine._batched = model
+    engine.transcribe(
+        audio, source="a.m4a",
+        options=DecodeOptions(batch_size=16, segment_timestamps=segment_timestamps),
+    )
+    assert model.calls[0][1]["without_timestamps"] is (not segment_timestamps)
+
+
+def test_default_cpu_threads_tracks_physical_cores(monkeypatch):
+    from transcribe.engine import default_cpu_threads
+
+    for logical, expected in [(2, 4), (8, 4), (12, 6), (20, 10), (64, 16), (None, 4)]:
+        monkeypatch.setattr(os, "cpu_count", lambda logical=logical: logical)
+        assert default_cpu_threads() == expected
+
+
+def _fake_snapshot(root, files=("config.json", "model.bin", "tokenizer.json")):
+    root.mkdir(parents=True)
+    for name in files:
+        (root / name).write_bytes(b"")
+    return str(root)
+
+
+def test_cached_model_is_loaded_without_asking_the_hub(tmp_path, monkeypatch):
+    import faster_whisper
+    import faster_whisper.utils
+
+    snapshot = _fake_snapshot(tmp_path / "snapshot")
+    lookups, created = [], []
+
+    def fake_download(name, local_files_only=False, cache_dir=None, **kwargs):
+        lookups.append(local_files_only)
+        return snapshot
+
+    monkeypatch.setattr(faster_whisper.utils, "download_model", fake_download)
+    monkeypatch.setattr(faster_whisper, "WhisperModel", lambda path, **kw: created.append((path, kw)) or "model")
+
+    engine = WhisperEngine(EngineOptions(model="large-v3", device="cpu"))
+    assert engine.load() == "model"
+    assert lookups == [True]  # cache only; the network was never consulted
+    assert created[0][0] == snapshot
+    assert created[0][1]["cpu_threads"] >= 4
+
+
+def test_uncached_or_partial_model_goes_to_the_hub(tmp_path, monkeypatch):
+    import faster_whisper
+    import faster_whisper.utils
+
+    from transcribe.engine import cached_model_path
+
+    partial = _fake_snapshot(tmp_path / "partial", files=("config.json",))  # interrupted download
+    monkeypatch.setattr(faster_whisper.utils, "download_model", lambda *a, **kw: partial)
+    assert cached_model_path("large-v3") is None
+
+    def missing(*args, **kwargs):
+        raise FileNotFoundError("not in cache")
+
+    monkeypatch.setattr(faster_whisper.utils, "download_model", missing)
+    created = []
+    monkeypatch.setattr(faster_whisper, "WhisperModel", lambda path, **kw: created.append(path) or "model")
+    WhisperEngine(EngineOptions(model="large-v3", device="cpu")).load()
+    assert created == ["large-v3"]  # faster-whisper downloads it as before
+
+
+def test_local_model_directory_is_used_as_is(tmp_path):
+    from transcribe.engine import cached_model_path
+
+    assert cached_model_path(str(tmp_path)) == str(tmp_path)
+
+
+def test_load_failure_is_a_model_load_error():
+    from transcribe.errors import ModelLoadError
+
+    engine = WhisperEngine(EngineOptions(model="tiny", local_files_only=True))
+    with pytest.raises(ModelLoadError):
+        engine.load()
+
+
+class OutOfMemoryAbove(FakeModel):
+    """Runs out of GPU memory whenever the batch is bigger than `fits`."""
+
+    def __init__(self, fits):
+        super().__init__()
+        self.fits = fits
+
+    def transcribe(self, audio, **kwargs):
+        self.calls.append((audio, kwargs))
+        if kwargs["batch_size"] > self.fits:
+            raise RuntimeError("CUDA failed with error out of memory")
+        return iter(self.segments), FakeInfo()
+
+
+def _gpu_engine(model, warnings=None):
+    """An explicit --device cuda engine whose 'reloads' hand back `model`."""
+    engine = WhisperEngine(
+        EngineOptions(device="cuda"), warn=(warnings.append if warnings is not None else lambda m: None)
+    )
+    engine.loads = 0
+
+    def create():
+        engine.loads += 1
+        return model
+
+    engine._create_model = create
+    engine._batched_pipeline = lambda loaded: loaded
+    return engine
+
+
+def test_out_of_memory_halves_the_batch_until_it_fits(audio):
+    warnings = []
+    model = OutOfMemoryAbove(fits=4)
+    engine = _gpu_engine(model, warnings)
+
+    transcript = engine.transcribe(audio, source="a.m4a", options=DecodeOptions(batch_size=16))
+
+    assert transcript.text == "Hello there. Second line."
+    assert [kwargs["batch_size"] for _, kwargs in model.calls] == [16, 8, 4]
+    assert len(warnings) == 2 and "out of memory" in warnings[0]
+    assert engine.loads == 3  # a fresh model after each out-of-memory error
+    assert engine.device == "cuda"  # stayed on the GPU
+
+    # the next file starts at the size that worked, on the model already loaded
+    engine.transcribe(audio, source="b.m4a", options=DecodeOptions(batch_size=16))
+    assert model.calls[-1][1]["batch_size"] == 4 and len(model.calls) == 4
+    assert engine.loads == 3
+
+
+def test_out_of_memory_at_batch_size_one_explains_what_to_try(audio):
+    model = OutOfMemoryAbove(fits=0)
+    engine = _gpu_engine(model)
+
+    with pytest.raises(EngineError, match="int8_float16"):
+        engine.transcribe(audio, source="a.m4a", options=DecodeOptions(batch_size=2))
+    assert [kwargs["batch_size"] for _, kwargs in model.calls] == [2, 1]
+
+
+def test_gpu_left_broken_after_out_of_memory_names_the_batch_size_to_use(audio):
+    """What the user's card did: the retry after an OOM failed differently."""
+
+    class BrokenAfterOOM(FakeModel):
+        def transcribe(self, audio, **kwargs):
+            self.calls.append((audio, kwargs))
+            if len(self.calls) == 1:
+                raise RuntimeError("CUDA failed with error out of memory")
+            raise RuntimeError("parallel_for failed: cudaErrorInvalidDevice: invalid device ordinal")
+
+    engine = _gpu_engine(BrokenAfterOOM())
+    with pytest.raises(EngineError, match="Start again with --batch-size 8"):
+        engine.transcribe(audio, source="a.m4a", options=DecodeOptions(batch_size=16))

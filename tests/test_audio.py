@@ -16,6 +16,21 @@ def test_decodes_m4a_to_mono_float32_at_16k(m4a_file):
     assert float(np.abs(audio.samples).max()) > 0.05  # actually carries signal
 
 
+def test_ffmpeg_fallback_matches_pyav(m4a_file):
+    import shutil
+
+    from transcribe.audio import _decode_with_ffmpeg
+
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg CLI not installed")
+    pyav = load_audio(m4a_file).samples
+    ffmpeg = _decode_with_ffmpeg(m4a_file, SAMPLE_RATE)
+
+    assert ffmpeg.dtype == np.float32 and ffmpeg.flags.writeable
+    assert len(ffmpeg) == pytest.approx(len(pyav), abs=SAMPLE_RATE // 10)
+    assert float(np.abs(ffmpeg).max()) == pytest.approx(float(np.abs(pyav).max()), abs=0.05)
+
+
 def test_probe_duration_matches_decoded_length(m4a_file):
     assert probe_duration(m4a_file) == pytest.approx(load_audio(m4a_file).duration, abs=0.2)
 
