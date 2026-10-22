@@ -11,3 +11,7 @@ class AudioDecodeError(TranscribeError):
 
 class EngineError(TranscribeError):
     """Raised when the speech-recognition backend cannot be set up or run."""
+
+
+class ModelLoadError(EngineError):
+    """The model itself cannot be loaded, so no file in a batch can succeed."""

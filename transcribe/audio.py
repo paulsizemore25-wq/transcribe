@@ -36,7 +36,7 @@ AUDIO_EXTENSIONS = frozenset(
 class Audio:
     """Decoded PCM plus the bits of metadata the rest of the program needs."""
 
-    samples: np.ndarray  # float32, mono, in [-1, 1]
+    samples: np.ndarray  # float32, mono, nominally in [-1, 1]
     sample_rate: int = SAMPLE_RATE
 
     @property
@@ -96,7 +96,9 @@ def _decode_with_pyav(path: Path, sample_rate: int) -> np.ndarray:
     except ImportError as exc:  # pragma: no cover - depends on the environment
         raise _PyAVUnavailable(str(exc)) from exc
 
-    resampler = AudioResampler(format="s16", layout="mono", rate=sample_rate)
+    # Straight to float32: decoders like AAC produce floats natively, so a
+    # detour through int16 only costs time and two extra copies of the audio.
+    resampler = AudioResampler(format="flt", layout="mono", rate=sample_rate)
     chunks: list[np.ndarray] = []
     try:
         with av.open(str(path)) as container:
@@ -116,7 +118,7 @@ def _decode_with_pyav(path: Path, sample_rate: int) -> np.ndarray:
 
     if not chunks:
         return np.zeros(0, dtype=np.float32)
-    return _to_float32(np.concatenate(chunks))
+    return np.concatenate(chunks).astype(np.float32, copy=False)
 
 
 def _decode_with_ffmpeg(path: Path, sample_rate: int) -> np.ndarray:
@@ -129,14 +131,11 @@ def _decode_with_ffmpeg(path: Path, sample_rate: int) -> np.ndarray:
         )
     command = [
         ffmpeg, "-nostdin", "-loglevel", "error", "-i", str(path),
-        "-f", "s16le", "-ac", "1", "-ar", str(sample_rate), "-",
+        "-f", "f32le", "-ac", "1", "-ar", str(sample_rate), "-",
     ]
     process = subprocess.run(command, capture_output=True)
     if process.returncode != 0:
         detail = process.stderr.decode("utf-8", "replace").strip()
         raise AudioDecodeError(f"ffmpeg failed on {path}: {detail}")
-    return _to_float32(np.frombuffer(process.stdout, dtype=np.int16))
-
-
-def _to_float32(pcm: np.ndarray) -> np.ndarray:
-    return (pcm.astype(np.float32) / 32768.0).copy()
+    # A writable copy: frombuffer over bytes is read-only.
+    return np.frombuffer(process.stdout, dtype="<f4").astype(np.float32)

@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from .audio import Audio
-from .errors import EngineError
+from .errors import EngineError, ModelLoadError
 from .transcript import Segment, Transcript, Word
 
 # Rough VRAM/RAM ordering, smallest first.  `large-v3-turbo` is the sweet spot:
@@ -111,6 +111,31 @@ def _register_cuda_libraries() -> None:
             pass  # reported properly by cuda_library_status / the real load
 
 
+# What faster-whisper needs from a model repo; a snapshot without them is an
+# interrupted download.
+_MODEL_FILES = ("config.json", "model.bin")
+
+
+def cached_model_path(model: str, cache_dir: str | None = None) -> str | None:
+    """The local copy of a model, found without touching the network.
+
+    Given a bare name, faster-whisper asks Hugging Face for the latest commit
+    on every run, for weights that never change: a round trip at best, a
+    timeout on a flaky connection, and a hard failure behind a broken proxy.
+    """
+    if os.path.isdir(model):
+        return model
+    try:
+        from faster_whisper.utils import download_model
+
+        path = download_model(model, local_files_only=True, cache_dir=cache_dir)
+    except Exception:
+        return None
+    if all(os.path.isfile(os.path.join(path, name)) for name in _MODEL_FILES):
+        return path
+    return None
+
+
 @dataclass
 class EngineOptions:
     """How the model itself is loaded."""
@@ -118,7 +143,7 @@ class EngineOptions:
     model: str = DEFAULT_MODEL
     device: str = "auto"          # auto | cpu | cuda
     compute_type: str = "auto"    # auto | int8 | int8_float16 | float16 | float32 | ...
-    cpu_threads: int = 0          # 0 lets CTranslate2 decide
+    cpu_threads: int = 0          # 0 = default_cpu_threads()
     download_root: str | None = None
     local_files_only: bool = False
 
@@ -140,6 +165,9 @@ class DecodeOptions:
     # Guards against Whisper's classic failure mode: looping text over silence.
     hallucination_silence_threshold: float | None = 2.0
     batch_size: int = 0                    # >1 enables the batched pipeline
+    # Batched pipeline only: False emits one segment per ~30 s chunk, which
+    # is slightly faster and fine for plain text but useless for subtitles.
+    segment_timestamps: bool = True
     extra: dict = field(default_factory=dict)
 
 
@@ -181,6 +209,7 @@ class WhisperEngine:
         self._warn = warn or (lambda message: None)
         self._model = None
         self._batched = None
+        self._warned_unbatched = False
 
     # -- model loading -----------------------------------------------------
 
@@ -192,12 +221,12 @@ class WhisperEngine:
             self._model = self._create_model()
         except Exception as exc:
             if not self._can_fall_back(exc):
-                raise EngineError(self._explain_load_failure(exc)) from exc
+                raise ModelLoadError(self._explain_load_failure(exc)) from exc
             self._fall_back_to_cpu(exc)
             try:
                 self._model = self._create_model()
             except Exception as retry_exc:
-                raise EngineError(self._explain_load_failure(retry_exc)) from retry_exc
+                raise ModelLoadError(self._explain_load_failure(retry_exc)) from retry_exc
         return self._model
 
     def _create_model(self):
@@ -211,11 +240,12 @@ class WhisperEngine:
         if self.device == "cuda":
             _register_cuda_libraries()
 
+        model_path = cached_model_path(self.options.model, self.options.download_root)
         return WhisperModel(
-            self.options.model,
+            model_path or self.options.model,
             device=self.device,
             compute_type=self.compute_type,
-            cpu_threads=self.options.cpu_threads,
+            cpu_threads=self.options.cpu_threads or default_cpu_threads(),
             download_root=self.options.download_root,
             local_files_only=self.options.local_files_only,
         )
@@ -267,7 +297,7 @@ class WhisperEngine:
         progress: ProgressCallback | None = None,
     ) -> Transcript:
         options = options or DecodeOptions()
-        model = self.load()
+        self.load()
         started = time.monotonic()
 
         kwargs = dict(
@@ -288,13 +318,22 @@ class WhisperEngine:
             kwargs["hallucination_silence_threshold"] = options.hallucination_silence_threshold
         kwargs.update(options.extra)
 
-        if options.batch_size and options.batch_size > 1:
+        batched = bool(options.batch_size and options.batch_size > 1)
+        if batched and not options.vad_filter:
+            # The batched pipeline cuts long audio at the pauses VAD finds and
+            # refuses anything over 30 s without them.
+            if not self._warned_unbatched:
+                self._warn("--no-vad turns batching off: the batched pipeline needs VAD to split the audio.")
+                self._warned_unbatched = True
+            batched = False
+        if batched:
             kwargs["batch_size"] = options.batch_size
+            kwargs["without_timestamps"] = not options.segment_timestamps
             kwargs.pop("condition_on_previous_text", None)
             kwargs.pop("hallucination_silence_threshold", None)
 
         try:
-            segments, info = self._run(audio, kwargs, options, progress)
+            segments, info = self._run(audio, kwargs, batched, progress)
         except EngineError:
             raise
         except Exception as exc:
@@ -306,7 +345,9 @@ class WhisperEngine:
             # so a broken GPU install surfaces here rather than at load time.
             self._fall_back_to_cpu(exc)
             try:
-                segments, info = self._run(audio, kwargs, options, progress)
+                segments, info = self._run(audio, kwargs, batched, progress)
+            except EngineError:
+                raise
             except Exception as retry_exc:
                 raise EngineError(
                     f"transcription failed for {source}: {type(retry_exc).__name__}: {retry_exc}"
@@ -323,10 +364,10 @@ class WhisperEngine:
             elapsed=time.monotonic() - started,
         )
 
-    def _run(self, audio: Audio, kwargs: dict, options: DecodeOptions, progress):
+    def _run(self, audio: Audio, kwargs: dict, batched: bool, progress):
         model = self.load()
         runner = model
-        if options.batch_size and options.batch_size > 1:
+        if batched:
             runner = self._batched_pipeline(model)
         raw_segments, info = runner.transcribe(audio.samples, **kwargs)
         # The generator is consumed here, inside the caller's error handling,
@@ -401,5 +442,11 @@ def cuda_library_status() -> tuple[bool, str]:
 
 
 def default_cpu_threads() -> int:
-    """A sane thread count when the user has not asked for one."""
-    return max(1, (os.cpu_count() or 4))
+    """About one thread per physical core, when the user has not asked.
+
+    CTranslate2 on its own uses 4 threads however big the machine is.  Logical
+    CPUs are usually two per core, and OpenMP slows down when oversubscribed,
+    hence the halving; never fewer than CTranslate2's 4, and gains flatten out
+    long before 16.
+    """
+    return max(4, min(16, (os.cpu_count() or 4) // 2))

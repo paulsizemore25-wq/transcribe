@@ -64,13 +64,24 @@ passing after any dependency upgrade.
   `hallucination_silence_threshold`; the engine strips them.
 - PyAV's wheel has no libvorbis encoder: test .ogg files are made with the
   native `vorbis` encoder (`strict=experimental`). Decoding is unaffected.
+- faster-whisper given a model *name* asks the Hub for the latest commit on
+  every run, and a `ProxyError` there is fatal even with the model cached.
+  `engine.cached_model_path` resolves the cache first; only a miss downloads.
+- CTranslate2's default is 4 CPU threads regardless of the machine;
+  `default_cpu_threads()` picks ~one per physical core instead.
+- The batched pipeline (faster-whisper 1.2) raises "No clip timestamps found"
+  without VAD on audio over 30 s, so `--no-vad` disables batching. It uses
+  only the first temperature, and defaults to `without_timestamps=True`
+  (one segment per ~30 s chunk); the CLI asks for timestamps unless the only
+  output format is txt.
+- Decoding is ~5 s per 30 min of audio here; the CLI decodes the next file
+  on a daemon thread while the current one transcribes.
 
 ## Privacy
 
 Our package imports no networking code. The only network access is
-huggingface_hub: the one-time model download, plus a commit-hash metadata
-check on each run unless `--offline` (or `HF_HUB_OFFLINE=1`) is set. Never
-add telemetry, uploads, or cloud APIs.
+huggingface_hub's one-time model download; once a model is cached, runs make
+no network requests at all. Never add telemetry, uploads, or cloud APIs.
 
 ## Status
 

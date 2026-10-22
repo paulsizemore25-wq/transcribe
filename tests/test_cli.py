@@ -10,7 +10,6 @@ import json
 import pytest
 
 from transcribe import cli
-from transcribe.errors import AudioDecodeError
 from transcribe.transcript import Segment, Transcript
 
 
@@ -19,11 +18,20 @@ class StubEngine:
 
     instances = []
 
+    load_error = None
+
     def __init__(self, options=None, warn=None):
         self.options = options
         self.warn = warn
+        self.device, self.compute_type = "cpu", "int8"
         self.calls = []
+        self.loads = 0
         StubEngine.instances.append(self)
+
+    def load(self):
+        self.loads += 1
+        if StubEngine.load_error is not None:
+            raise StubEngine.load_error
 
     def transcribe(self, audio, source, options=None, progress=None):
         self.calls.append({"source": source, "duration": audio.duration, "options": options})
@@ -48,6 +56,7 @@ class StubEngine:
 @pytest.fixture(autouse=True)
 def stub_engine(monkeypatch):
     StubEngine.instances = []
+    StubEngine.load_error = None
     monkeypatch.setattr(cli, "WhisperEngine", StubEngine)
     return StubEngine
 
@@ -101,7 +110,39 @@ def test_skip_existing_leaves_completed_work_alone(m4a_file):
 
     assert cli.main([str(m4a_file), "--skip-existing"]) == 0
     assert output.read_text() == "previous run\n"
-    assert StubEngine.instances[0].calls == []
+    assert StubEngine.instances == []  # not even the model gets loaded
+
+
+def test_model_load_failure_stops_the_batch(make_m4a, tmp_path, capsys):
+    from transcribe.errors import ModelLoadError
+
+    make_m4a("many/one.m4a")
+    make_m4a("many/two.m4a")
+    StubEngine.load_error = ModelLoadError("could not fetch the 'tiny' model")
+
+    assert cli.main([str(tmp_path / "many")]) == 1
+    engine = StubEngine.instances[0]
+    assert engine.loads == 1 and engine.calls == []  # not retried for every file
+    assert "could not fetch" in capsys.readouterr().err
+
+
+def test_files_are_processed_in_order_with_decoding_ahead(make_m4a, tmp_path):
+    names = ["a.m4a", "b.m4a", "c.m4a"]
+    paths = [make_m4a(f"seq/{name}", seconds=1.0 + i) for i, name in enumerate(names)]
+
+    assert cli.main([str(tmp_path / "seq")]) == 0
+    calls = StubEngine.instances[0].calls
+    assert [call["source"] for call in calls] == [str(p) for p in paths]
+    # each file got its own audio, not a neighbour's
+    assert [round(call["duration"]) for call in calls] == [1, 2, 3]
+
+
+def test_segment_timestamps_only_requested_when_a_format_needs_them(m4a_file):
+    cli.main([str(m4a_file), "-q"])
+    cli.main([str(m4a_file), "-q", "-f", "txt,srt"])
+    first, second = (engine.calls[0]["options"] for engine in StubEngine.instances)
+    assert first.segment_timestamps is False
+    assert second.segment_timestamps is True
 
 
 def test_reruns_overwrite_by_default(m4a_file):
